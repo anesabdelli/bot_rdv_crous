@@ -362,7 +362,6 @@ def send_ntfy_alarm(listing_title: str) -> None:
 
 
 # ── Monitoring loop ───────────────────────────────────────────────────────────
-
 async def monitor_loop(app: Application) -> None:
     logger.info("Monitoring loop started")
     await send_notification(
@@ -412,14 +411,30 @@ async def monitor_loop(app: Application) -> None:
         if prev_blocked and status == "ok":
             state["blocked"] = False
             state["error_streak"] = 0
-            await send_notification(app, "✅ <b>Surveillance reprise</b> – les requêtes fonctionnent à nouveau.")
+            await send_notification(
+                app,
+                "✅ <b>Surveillance reprise</b> – les requêtes fonctionnent à nouveau."
+            )
 
+        # ── Errors ───────────────────────────────────────────────────────────
         if status == "error":
             state["error_streak"] += 1
+
+            # HTTP 500 from CROUS is completely silent.
+            # Do not notify the Telegram user and keep checking normally.
+            if result.get("http_code") == 500:
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # Keep the existing notification behavior for all other errors.
             if state["error_streak"] == 1:
                 await send_notification(
-                    app, f"⚠️ <b>Échec de la vérification</b>\n{detail}\nNouvelle tentative dans {CHECK_INTERVAL}s."
+                    app,
+                    f"⚠️ <b>Échec de la vérification</b>\n"
+                    f"{detail}\n"
+                    f"Nouvelle tentative dans {CHECK_INTERVAL}s."
                 )
+
             await asyncio.sleep(CHECK_INTERVAL)
             continue
 
@@ -427,6 +442,7 @@ async def monitor_loop(app: Application) -> None:
 
         # ── Diff against the previous check ──────────────────────────────────
         current_ids = result["ids"]
+
         if state["known_ids"] is None:
             # First check after starting: just record the baseline, no alarm.
             state["known_ids"] = current_ids
@@ -435,15 +451,19 @@ async def monitor_loop(app: Application) -> None:
                 f"ℹ️ Référence enregistrée : <b>{len(current_ids)}</b> logement(s) actuellement visibles "
                 f"dans cette zone.\nJe vous alerte dès qu'un nouveau logement apparaît."
             )
+
         else:
             new_ids = current_ids - state["known_ids"]
+
             if new_ids:
                 for aid in new_ids:
                     info = result["listings"].get(aid, {})
                     title = info.get("title", f"Logement #{aid}")
                     price = info.get("price", "prix non précisé")
                     url = info.get("url", state["search_url"])
+
                     send_ntfy_alarm(title)
+
                     await send_alarm(
                         app,
                         f"<b>NOUVEAU LOGEMENT CROUS !</b>\n"
@@ -451,6 +471,7 @@ async def monitor_loop(app: Application) -> None:
                         f"💶 {price}\n"
                         f"👉 <a href=\"{url}\">Voir l'annonce et réserver</a>"
                     )
+
             state["known_ids"] = current_ids
 
         await asyncio.sleep(CHECK_INTERVAL)
