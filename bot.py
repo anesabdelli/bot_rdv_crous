@@ -3,6 +3,12 @@
 Telegram bot that monitors trouverunlogement.lescrous.fr for newly published
 student housing offers ("logements") in a chosen search zone.
 
+MULTI-USER VERSION
+------------------
+Every chat_id gets its own independent state (zone, known ids, monitoring
+flag, etc.) and its own background "worker" task. Starting /monitor in one
+person's chat has zero effect on anyone else's.
+
 Two ways to pick a search zone:
   1) /ville  -> type a city or département name, the bot geocodes it
                 (via the official geo.api.gouv.fr API) and builds a
@@ -12,12 +18,13 @@ Two ways to pick a search zone:
                 la zone" on the site, then paste the resulting URL back to
                 the bot (it will contain a bounds=... parameter).
 
-Detection logic (each poll):
+Detection logic (each poll, per user):
   - Fetch the stored search URL.
   - HTTP 429 / 403 / CAPTCHA-like page -> blocked/rate-limited -> notify + back off.
   - Otherwise, parse every accommodation link (/accommodations/<id>) on the
-    page. Compare against the ids seen on the previous check. Any id that
-    is new fires the alarm (Telegram loud message + optional ntfy.sh push).
+    page. Compare against the ids seen on the previous check for THAT user.
+    Any id that is new fires the alarm (Telegram loud message + optional
+    ntfy.sh push to that user's topic, if configured).
 """
 
 import asyncio
@@ -28,7 +35,7 @@ import re
 import sys
 from datetime import datetime
 from functools import wraps
-from typing import Optional
+from typing import Dict, Optional
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,8 +54,18 @@ load_dotenv(dotenv_path=".env", override=False)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID", "")
-NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
+
+# Optional allowlist. Leave empty to let ANY Telegram user talk to the bot
+# (needed for a "public" multi-user bot). If you want to restrict it to a
+# fixed set of people, put comma-separated chat ids here, e.g.
+#   ALLOWED_CHAT_IDS=111111111,222222222
+ALLOWED_CHAT_IDS = {
+    c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()
+}
+
+# Optional: a single shared ntfy topic prefix. Each user gets their own
+# sub-topic derived from their chat_id, so pushes don't collide.
+NTFY_TOPIC_BASE = os.getenv("NTFY_TOPIC", "")
 
 # Base search URL for the current campaign. CROUS changes the numeric tool id
 # every academic year (e.g. /tools/47/search for 2026-2027). If the bot stops
@@ -90,30 +107,48 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 ]
 
-# ── Shared state (single-user bot, mirrors the RDV bot's design) ──────────────
-state: dict = {
-    "monitoring":   False,
-    "search_url":   None,   # full CROUS search URL with bounds=...
-    "zone_label":   None,   # human readable label ("Paris (75)", "zone carte", ...)
-    "known_ids":    None,   # set[str] of accommodation ids seen on the last check
-    "blocked":      False,
-    "check_count":  0,
-    "last_check":   None,   # datetime
-    "extra_wait":   0,      # extra seconds to wait before next check
-    "error_streak": 0,      # consecutive errors without a clean check
-    "awaiting":     None,   # "city" | "url" | None -> what the next free-text message means
-}
+# ── Per-user state ─────────────────────────────────────────────────────────────
+# KEY CHANGE: instead of one global `state` dict shared by everyone, we keep
+# a dict of dicts, one entry per chat_id. Each user's /ville, /monitor, etc.
+# only ever touch their own entry.
+USER_STATES: Dict[int, dict] = {}
+
+# One background asyncio task per user who has /monitor running, so that
+# starting/stopping monitoring for one person never affects another.
+MONITOR_TASKS: Dict[int, asyncio.Task] = {}
+
+
+def get_state(chat_id: int) -> dict:
+    """Return (creating if needed) the per-user state dict for this chat_id."""
+    if chat_id not in USER_STATES:
+        USER_STATES[chat_id] = {
+            "monitoring":   False,
+            "search_url":   None,   # full CROUS search URL with bounds=...
+            "zone_label":   None,   # human readable label ("Paris (75)", "zone carte", ...)
+            "known_ids":    None,   # set[str] of accommodation ids seen on the last check
+            "blocked":      False,
+            "check_count":  0,
+            "last_check":   None,   # datetime
+            "extra_wait":   0,      # extra seconds to wait before next check
+            "error_streak": 0,      # consecutive errors without a clean check
+            "awaiting":     None,   # "city" | "url" | None -> what the next free-text message means
+        }
+    return USER_STATES[chat_id]
 
 
 # ── Access control ────────────────────────────────────────────────────────────
 
 def restricted(handler):
-    """Ignore commands from anyone other than the configured CHAT_ID (if set)."""
+    """
+    If ALLOWED_CHAT_IDS is empty, everyone is allowed (public multi-user bot).
+    If it's non-empty, only those chat ids can use the bot.
+    """
 
     @wraps(handler)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if CHAT_ID and str(update.effective_chat.id) != str(CHAT_ID):
-            logger.warning(f"Ignored message from unauthorized chat {update.effective_chat.id}")
+        chat_id = update.effective_chat.id
+        if ALLOWED_CHAT_IDS and str(chat_id) not in ALLOWED_CHAT_IDS:
+            logger.warning(f"Ignored message from unauthorized chat {chat_id}")
             return
         return await handler(update, ctx)
 
@@ -228,6 +263,8 @@ def build_search_url(bounds: tuple) -> str:
 
 
 # ── Website checker ───────────────────────────────────────────────────────────
+# Stateless: takes a URL, returns results. Safe to call concurrently from
+# many users' monitor loops at once.
 
 def check_listings(search_url: str) -> dict:
     """
@@ -315,39 +352,39 @@ def check_listings(search_url: str) -> dict:
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
+# KEY CHANGE: every send function now takes an explicit chat_id (the user
+# it's talking to) instead of a single hardcoded CHAT_ID.
 
-async def send_notification(app: Application, text: str, reply_markup=None) -> None:
-    if not CHAT_ID:
-        logger.warning("TELEGRAM_CHAT_ID not set – cannot send notification")
-        return
+async def send_notification(app: Application, chat_id: int, text: str, reply_markup=None) -> None:
     try:
         await app.bot.send_message(
-            chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+            chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
         )
     except Exception as exc:
-        logger.error(f"Failed to send Telegram message: {exc}")
+        logger.error(f"Failed to send Telegram message to {chat_id}: {exc}")
 
 
-async def send_alarm(app: Application, text: str) -> None:
+async def send_alarm(app: Application, chat_id: int, text: str) -> None:
     """Loud notification for a brand-new listing."""
     try:
         await app.bot.send_message(
-            chat_id=CHAT_ID,
+            chat_id=chat_id,
             text="🚨🔥 " + text,
             parse_mode=ParseMode.HTML,
             disable_notification=False,
         )
     except Exception as exc:
-        logger.error(f"Failed to send alarm message: {exc}")
+        logger.error(f"Failed to send alarm message to {chat_id}: {exc}")
 
 
-def send_ntfy_alarm(listing_title: str) -> None:
-    """Send a max-priority push notification via ntfy.sh."""
-    if not NTFY_TOPIC:
+def send_ntfy_alarm(chat_id: int, listing_title: str) -> None:
+    """Send a max-priority push notification via ntfy.sh, on a per-user sub-topic."""
+    if not NTFY_TOPIC_BASE:
         return
+    topic = f"{NTFY_TOPIC_BASE}-{chat_id}"
     try:
         requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
+            f"https://ntfy.sh/{topic}",
             headers={
                 "Title":    "LOGEMENT CROUS DISPONIBLE !!!",
                 "Priority": "urgent",
@@ -356,127 +393,130 @@ def send_ntfy_alarm(listing_title: str) -> None:
             data=f"Nouveau logement : {listing_title}".encode("utf-8"),
             timeout=10,
         )
-        logger.info("ntfy alarm sent")
+        logger.info(f"ntfy alarm sent on topic {topic}")
     except Exception as exc:
         logger.error(f"Failed to send ntfy notification: {exc}")
 
 
 # ── Monitoring loop ───────────────────────────────────────────────────────────
-async def monitor_loop(app: Application) -> None:
-    logger.info("Monitoring loop started")
+# KEY CHANGE: takes chat_id, reads/writes ONLY that user's state entry, and
+# is launched as its own asyncio task per user (see cmd_monitor / MONITOR_TASKS).
+
+async def monitor_loop(app: Application, chat_id: int) -> None:
+    state = get_state(chat_id)
+    logger.info(f"Monitoring loop started for chat {chat_id}")
     await send_notification(
-        app,
+        app, chat_id,
         f"🔍 <b>Surveillance démarrée</b>\n"
         f"Zone : {state['zone_label'] or 'personnalisée'}\n"
         f"Fréquence : toutes les {CHECK_INTERVAL}s\n"
         f"🔗 {state['search_url']}"
     )
 
-    while state["monitoring"]:
-        if state["extra_wait"] > 0:
-            wait = state["extra_wait"]
-            state["extra_wait"] = 0
-            logger.info(f"Back-off: waiting {wait}s before next check")
-            for _ in range(wait):
+    try:
+        while state["monitoring"]:
+            if state["extra_wait"] > 0:
+                wait = state["extra_wait"]
+                state["extra_wait"] = 0
+                logger.info(f"[{chat_id}] Back-off: waiting {wait}s before next check")
+                for _ in range(wait):
+                    if not state["monitoring"]:
+                        break
+                    await asyncio.sleep(1)
                 if not state["monitoring"]:
                     break
-                await asyncio.sleep(1)
-            if not state["monitoring"]:
-                break
 
-        result = check_listings(state["search_url"])
-        status = result["status"]
-        detail = result["detail"]
-        prev_blocked = state["blocked"]
+            result = check_listings(state["search_url"])
+            status = result["status"]
+            detail = result["detail"]
+            prev_blocked = state["blocked"]
 
-        state["check_count"] += 1
-        state["last_check"] = datetime.now()
-        logger.info(f"Check #{state['check_count']}: [{status}] {detail}")
+            state["check_count"] += 1
+            state["last_check"] = datetime.now()
+            logger.info(f"[{chat_id}] Check #{state['check_count']}: [{status}] {detail}")
 
-        # ── Blocked / rate-limited / CAPTCHA ─────────────────────────────────
-        if status in ("blocked", "rate_limited", "captcha"):
-            state["error_streak"] += 1
-            if not state["blocked"]:
-                state["blocked"] = True
-                await send_notification(
-                    app,
-                    f"⛔ <b>Surveillance bloquée !</b>\n"
-                    f"Raison : {detail}\n\n"
-                    f"Pause de {BACKOFF_AFTER_BLOCK // 60} minutes avant la prochaine tentative…"
-                )
-            state["extra_wait"] = BACKOFF_AFTER_BLOCK
-            await asyncio.sleep(CHECK_INTERVAL)
-            continue
-
-        if prev_blocked and status == "ok":
-            state["blocked"] = False
-            state["error_streak"] = 0
-            await send_notification(
-                app,
-                "✅ <b>Surveillance reprise</b> – les requêtes fonctionnent à nouveau."
-            )
-
-        # ── Errors ───────────────────────────────────────────────────────────
-        if status == "error":
-            state["error_streak"] += 1
-
-            # HTTP 500 from CROUS is completely silent.
-            # Do not notify the Telegram user and keep checking normally.
-            if result.get("http_code") == 500:
+            # ── Blocked / rate-limited / CAPTCHA ─────────────────────────────
+            if status in ("blocked", "rate_limited", "captcha"):
+                state["error_streak"] += 1
+                if not state["blocked"]:
+                    state["blocked"] = True
+                    await send_notification(
+                        app, chat_id,
+                        f"⛔ <b>Surveillance bloquée !</b>\n"
+                        f"Raison : {detail}\n\n"
+                        f"Pause de {BACKOFF_AFTER_BLOCK // 60} minutes avant la prochaine tentative…"
+                    )
+                state["extra_wait"] = BACKOFF_AFTER_BLOCK
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            # Keep the existing notification behavior for all other errors.
-            if state["error_streak"] == 1:
+            if prev_blocked and status == "ok":
+                state["blocked"] = False
+                state["error_streak"] = 0
                 await send_notification(
-                    app,
-                    f"⚠️ <b>Échec de la vérification</b>\n"
-                    f"{detail}\n"
-                    f"Nouvelle tentative dans {CHECK_INTERVAL}s."
+                    app, chat_id,
+                    "✅ <b>Surveillance reprise</b> – les requêtes fonctionnent à nouveau."
                 )
 
-            await asyncio.sleep(CHECK_INTERVAL)
-            continue
+            # ── Errors ───────────────────────────────────────────────────────
+            if status == "error":
+                state["error_streak"] += 1
 
-        state["error_streak"] = 0
+                # HTTP 500 from CROUS is completely silent.
+                if result.get("http_code") == 500:
+                    await asyncio.sleep(CHECK_INTERVAL)
+                    continue
 
-        # ── Diff against the previous check ──────────────────────────────────
-        current_ids = result["ids"]
-
-        if state["known_ids"] is None:
-            # First check after starting: just record the baseline, no alarm.
-            state["known_ids"] = current_ids
-            await send_notification(
-                app,
-                f"ℹ️ Référence enregistrée : <b>{len(current_ids)}</b> logement(s) actuellement visibles "
-                f"dans cette zone.\nJe vous alerte dès qu'un nouveau logement apparaît."
-            )
-
-        else:
-            new_ids = current_ids - state["known_ids"]
-
-            if new_ids:
-                for aid in new_ids:
-                    info = result["listings"].get(aid, {})
-                    title = info.get("title", f"Logement #{aid}")
-                    price = info.get("price", "prix non précisé")
-                    url = info.get("url", state["search_url"])
-
-                    send_ntfy_alarm(title)
-
-                    await send_alarm(
-                        app,
-                        f"<b>NOUVEAU LOGEMENT CROUS !</b>\n"
-                        f"🏠 {title}\n"
-                        f"💶 {price}\n"
-                        f"👉 <a href=\"{url}\">Voir l'annonce et réserver</a>"
+                if state["error_streak"] == 1:
+                    await send_notification(
+                        app, chat_id,
+                        f"⚠️ <b>Échec de la vérification</b>\n"
+                        f"{detail}\n"
+                        f"Nouvelle tentative dans {CHECK_INTERVAL}s."
                     )
 
-            state["known_ids"] = current_ids
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
 
-        await asyncio.sleep(CHECK_INTERVAL)
+            state["error_streak"] = 0
 
-    logger.info("Monitoring loop stopped")
+            # ── Diff against the previous check ──────────────────────────────
+            current_ids = result["ids"]
+
+            if state["known_ids"] is None:
+                state["known_ids"] = current_ids
+                await send_notification(
+                    app, chat_id,
+                    f"ℹ️ Référence enregistrée : <b>{len(current_ids)}</b> logement(s) actuellement visibles "
+                    f"dans cette zone.\nJe vous alerte dès qu'un nouveau logement apparaît."
+                )
+            else:
+                new_ids = current_ids - state["known_ids"]
+
+                if new_ids:
+                    for aid in new_ids:
+                        info = result["listings"].get(aid, {})
+                        title = info.get("title", f"Logement #{aid}")
+                        price = info.get("price", "prix non précisé")
+                        url = info.get("url", state["search_url"])
+
+                        send_ntfy_alarm(chat_id, title)
+
+                        await send_alarm(
+                            app, chat_id,
+                            f"<b>NOUVEAU LOGEMENT CROUS !</b>\n"
+                            f"🏠 {title}\n"
+                            f"💶 {price}\n"
+                            f"👉 <a href=\"{url}\">Voir l'annonce et réserver</a>"
+                        )
+
+                state["known_ids"] = current_ids
+
+            await asyncio.sleep(CHECK_INTERVAL)
+    finally:
+        state["monitoring"] = False
+        MONITOR_TASKS.pop(chat_id, None)
+        logger.info(f"Monitoring loop stopped for chat {chat_id}")
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
@@ -501,10 +541,9 @@ MAIN_MENU_TEXT = (
 @restricted
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
+    get_state(chat_id)  # ensure this user has their own state entry
     await update.message.reply_html(
-        f"👋 Bienvenue !\n\nVotre chat ID est : <code>{chat_id}</code>\n"
-        f"Ajoutez <code>TELEGRAM_CHAT_ID={chat_id}</code> dans votre fichier <code>.env</code> "
-        f"si ce n'est pas déjà fait.\n\n{MAIN_MENU_TEXT}"
+        f"👋 Bienvenue !\n\nVotre chat ID est : <code>{chat_id}</code>\n\n{MAIN_MENU_TEXT}"
     )
 
 
@@ -515,6 +554,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_ville(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_state(update.effective_chat.id)
     state["awaiting"] = "city"
     await update.message.reply_html(
         "🏙️ Tapez le nom d'une <b>ville</b> (ex : <i>Lyon</i>) ou d'un <b>département</b> "
@@ -524,6 +564,7 @@ async def cmd_ville(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_carte(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_state(update.effective_chat.id)
     state["awaiting"] = "url"
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("🗺️ Cliquer ici pour choisir la zone sur la carte", url=CROUS_MAP_URL)]]
@@ -540,6 +581,7 @@ async def cmd_carte(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_zone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_state(update.effective_chat.id)
     if not state["search_url"]:
         await update.message.reply_text("Aucune zone configurée pour l'instant. Utilisez /ville ou /carte.")
         return
@@ -550,6 +592,7 @@ async def cmd_zone(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_state(update.effective_chat.id)
     state["search_url"] = None
     state["zone_label"] = None
     state["known_ids"] = None
@@ -559,10 +602,12 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
     if not state["search_url"]:
         await update.message.reply_text("⚠️ Choisissez d'abord une zone avec /ville ou /carte.")
         return
-    if state["monitoring"]:
+    if state["monitoring"] or chat_id in MONITOR_TASKS:
         await update.message.reply_text("Surveillance déjà active ! Utilisez /status pour voir l'état.")
         return
     state["monitoring"]   = True
@@ -570,20 +615,24 @@ async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state["extra_wait"]   = 0
     state["error_streak"] = 0
     state["known_ids"]    = None
-    ctx.application.create_task(monitor_loop(ctx.application))
+    # One independent background task per user ("worker").
+    MONITOR_TASKS[chat_id] = ctx.application.create_task(monitor_loop(ctx.application, chat_id))
 
 
 @restricted
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
     if not state["monitoring"]:
         await update.message.reply_text("La surveillance n'est pas active.")
         return
-    state["monitoring"] = False
+    state["monitoring"] = False  # monitor_loop will notice this and exit on its own
     await update.message.reply_text("🛑 Surveillance arrêtée.")
 
 
 @restricted
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    state = get_state(update.effective_chat.id)
     if not state["search_url"]:
         await update.message.reply_text("⚠️ Choisissez d'abord une zone avec /ville ou /carte.")
         return
@@ -602,10 +651,12 @@ async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
     await update.message.reply_text("🔔 Déclenchement d'une alerte de test…")
-    send_ntfy_alarm("[TEST] Logement fictif")
+    send_ntfy_alarm(chat_id, "[TEST] Logement fictif")
     await send_alarm(
-        ctx.application,
+        ctx.application, chat_id,
         f"<b>[TEST] NOUVEAU LOGEMENT CROUS !</b>\n"
         f"Ceci est une notification de test.\n\n"
         f"👉 <a href=\"{state['search_url'] or CROUS_SEARCH_BASE_URL}\">Voir les résultats</a>"
@@ -614,7 +665,7 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 @restricted
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    s = state
+    s = get_state(update.effective_chat.id)
     last = s["last_check"].strftime("%d/%m %H:%M:%S") if s["last_check"] else "jamais"
     known = len(s["known_ids"]) if s["known_ids"] is not None else "?"
     await update.message.reply_html(
@@ -632,6 +683,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 @restricted
 async def on_free_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the follow-up message after /ville or /carte."""
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
     text = (update.message.text or "").strip()
     awaiting = state["awaiting"]
 
@@ -649,9 +702,6 @@ async def on_free_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         state["search_url"] = url
         state["zone_label"] = geo["label"]
         state["known_ids"] = None
-        keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("▶️ Démarrer la surveillance", callback_data="noop")]]
-        )
         await update.message.reply_html(
             f"✅ Zone définie : <b>{geo['label']}</b>\n🔗 {url}\n\nUtilisez /monitor pour démarrer la surveillance."
         )
@@ -703,7 +753,6 @@ def main() -> None:
             "TELEGRAM_BOT_TOKEN is not set.\n"
             "Create a .env file with:\n"
             "  TELEGRAM_BOT_TOKEN=<your token>\n"
-            "  TELEGRAM_CHAT_ID=<your chat id>"
         )
         sys.exit(1)
 
