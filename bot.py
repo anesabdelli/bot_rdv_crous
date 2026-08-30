@@ -33,6 +33,7 @@ import os
 import random
 import re
 import sys
+import time
 from datetime import datetime
 from functools import wraps
 from typing import Dict, Optional
@@ -55,33 +56,25 @@ load_dotenv(dotenv_path=".env", override=False)
 # ── Configuration ─────────────────────────────────────────────────────────────
 BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-# Optional allowlist. Leave empty to let ANY Telegram user talk to the bot
-# (needed for a "public" multi-user bot). If you want to restrict it to a
-# fixed set of people, put comma-separated chat ids here, e.g.
-#   ALLOWED_CHAT_IDS=111111111,222222222
 ALLOWED_CHAT_IDS = {
     c.strip() for c in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if c.strip()
 }
 
-# Optional: a single shared ntfy topic prefix. Each user gets their own
-# sub-topic derived from their chat_id, so pushes don't collide.
 NTFY_TOPIC_BASE = os.getenv("NTFY_TOPIC", "")
 
-# Base search URL for the current campaign. CROUS changes the numeric tool id
-# every academic year (e.g. /tools/47/search for 2026-2027). If the bot stops
-# finding results, check the id on https://trouverunlogement.lescrous.fr and
-# update this value in your .env (CROUS_SEARCH_BASE_URL).
 CROUS_SEARCH_BASE_URL = os.getenv(
     "CROUS_SEARCH_BASE_URL",
     "https://trouverunlogement.lescrous.fr/tools/47/search",
 )
-CROUS_MAP_URL = CROUS_SEARCH_BASE_URL  # "Afficher sur une carte" lives on this page
+CROUS_MAP_URL = CROUS_SEARCH_BASE_URL
 
 GEO_API_BASE = "https://geo.api.gouv.fr"
 
-CHECK_INTERVAL       = int(os.getenv("CHECK_INTERVAL", "2"))     # seconds between checks
-REQUEST_TIMEOUT       = 15   # seconds for each HTTP request
+CHECK_INTERVAL       = int(os.getenv("CHECK_INTERVAL", "5"))     # seconds between checks (increased from 2)
+REQUEST_TIMEOUT       = 30   # seconds for each HTTP request (increased from 15)
 BACKOFF_AFTER_BLOCK    = 300  # 5 min pause after getting blocked
+BACKOFF_AFTER_ERROR    = 10   # 10s pause after transient error
+MAX_ERROR_STREAK       = 5    # give up after 5 consecutive errors
 BBOX_PADDING_DEG       = 0.01  # ~1km padding added around a geocoded zone
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -108,14 +101,11 @@ USER_AGENTS = [
 ]
 
 # ── Per-user state ─────────────────────────────────────────────────────────────
-# KEY CHANGE: instead of one global `state` dict shared by everyone, we keep
-# a dict of dicts, one entry per chat_id. Each user's /ville, /monitor, etc.
-# only ever touch their own entry.
 USER_STATES: Dict[int, dict] = {}
-
-# One background asyncio task per user who has /monitor running, so that
-# starting/stopping monitoring for one person never affects another.
 MONITOR_TASKS: Dict[int, asyncio.Task] = {}
+
+# Per-user HTTP session for connection reuse
+USER_SESSIONS: Dict[int, requests.Session] = {}
 
 
 def get_state(chat_id: int) -> dict:
@@ -123,17 +113,36 @@ def get_state(chat_id: int) -> dict:
     if chat_id not in USER_STATES:
         USER_STATES[chat_id] = {
             "monitoring":   False,
-            "search_url":   None,   # full CROUS search URL with bounds=...
-            "zone_label":   None,   # human readable label ("Paris (75)", "zone carte", ...)
-            "known_ids":    None,   # set[str] of accommodation ids seen on the last check
+            "search_url":   None,
+            "zone_label":   None,
+            "known_ids":    set(),  # Start as empty set, not None
             "blocked":      False,
             "check_count":  0,
-            "last_check":   None,   # datetime
-            "extra_wait":   0,      # extra seconds to wait before next check
-            "error_streak": 0,      # consecutive errors without a clean check
-            "awaiting":     None,   # "city" | "url" | None -> what the next free-text message means
+            "last_check":   None,
+            "extra_wait":   0,
+            "error_streak": 0,
+            "awaiting":     None,
+            "last_404_time": 0,    # Track time of last "0 results" to detect parsing issues
         }
     return USER_STATES[chat_id]
+
+
+def get_session(chat_id: int) -> requests.Session:
+    """Get or create a requests.Session for this user (connection reuse)."""
+    if chat_id not in USER_SESSIONS:
+        session = requests.Session()
+        # Persistent headers across all requests
+        session.headers.update({
+            "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language":           "fr-FR,fr;q=0.9,en;q=0.8",
+            "Accept-Encoding":           "gzip, deflate, br",
+            "Connection":                "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Cache-Control":             "no-cache",
+            "Referer":                   CROUS_SEARCH_BASE_URL,
+        })
+        USER_SESSIONS[chat_id] = session
+    return USER_SESSIONS[chat_id]
 
 
 # ── Access control ────────────────────────────────────────────────────────────
@@ -263,62 +272,113 @@ def build_search_url(bounds: tuple) -> str:
 
 
 # ── Website checker ───────────────────────────────────────────────────────────
-# Stateless: takes a URL, returns results. Safe to call concurrently from
-# many users' monitor loops at once.
 
-def check_listings(search_url: str) -> dict:
+def check_listings(search_url: str, chat_id: int) -> dict:
     """
     Fetch the CROUS search page and return:
       {
-        "status":     "ok" | "blocked" | "rate_limited" | "captcha" | "error",
+        "status":     "ok" | "blocked" | "rate_limited" | "captcha" | "error" | "empty_page",
         "detail":     str,
         "http_code":  int | None,
         "ids":        set[str],   # accommodation ids found on the page
         "listings":   {id: {"title", "price", "url"}},
-        "total_text": str | None, # e.g. "3 logements trouvés en France"
+        "total_text": str | None,
       }
     """
-    headers = {
-        "User-Agent":                random.choice(USER_AGENTS),
-        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language":           "fr-FR,fr;q=0.9,en;q=0.8",
-        "Accept-Encoding":           "gzip, deflate, br",
-        "Connection":                "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Cache-Control":             "no-cache",
-    }
+    session = get_session(chat_id)
+    
+    # Randomize user-agent for each request
+    session.headers["User-Agent"] = random.choice(USER_AGENTS)
 
     try:
-        resp = requests.get(search_url, headers=headers, timeout=REQUEST_TIMEOUT)
+        resp = session.get(search_url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
     except requests.exceptions.Timeout:
-        return {"status": "error", "detail": "Request timed out after 15s", "http_code": None}
+        return {
+            "status": "error",
+            "detail": f"Request timed out after {REQUEST_TIMEOUT}s (site might be slow)",
+            "http_code": None,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
     except requests.exceptions.ConnectionError as exc:
-        return {"status": "error", "detail": f"Connection error: {exc}", "http_code": None}
+        return {
+            "status": "error",
+            "detail": f"Connection error: {exc}",
+            "http_code": None,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
     except requests.exceptions.RequestException as exc:
-        return {"status": "error", "detail": f"Request failed: {exc}", "http_code": None}
+        return {
+            "status": "error",
+            "detail": f"Request failed: {exc}",
+            "http_code": None,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
 
     code = resp.status_code
 
     if code == 429:
         retry_after = resp.headers.get("Retry-After", "unknown")
-        return {"status": "rate_limited", "detail": f"HTTP 429 – Retry-After: {retry_after}s", "http_code": 429}
+        return {
+            "status": "rate_limited",
+            "detail": f"HTTP 429 – Rate limited. Retry-After: {retry_after}s",
+            "http_code": 429,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
     if code == 403:
-        return {"status": "blocked", "detail": "HTTP 403 Forbidden (IP blocked?)", "http_code": 403}
+        return {
+            "status": "blocked",
+            "detail": "HTTP 403 Forbidden (IP blocked or session invalid)",
+            "http_code": 403,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
     if code == 503:
-        return {"status": "error", "detail": "HTTP 503 Service Unavailable", "http_code": 503}
-    if code != 200:
-        return {"status": "error", "detail": f"Unexpected HTTP {code}", "http_code": code}
+        return {
+            "status": "error",
+            "detail": "HTTP 503 Service Unavailable (CROUS maintenance?)",
+            "http_code": 503,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
+    if code not in (200, 304):
+        return {
+            "status": "error",
+            "detail": f"Unexpected HTTP {code}",
+            "http_code": code,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
 
     page_text_lower = resp.text.lower()
-    captcha_signals = ["captcha", "i'm not a robot", "je ne suis pas un robot", "cloudflare", "trop nombreux"]
+    captcha_signals = ["captcha", "i'm not a robot", "je ne suis pas un robot", "cloudflare", "trop nombreux", "recaptcha"]
     if any(sig in page_text_lower for sig in captcha_signals):
-        return {"status": "captcha", "detail": "CAPTCHA / anti-bot / overload page detected", "http_code": 200}
+        return {
+            "status": "captcha",
+            "detail": "CAPTCHA / anti-bot page detected. Backing off.",
+            "http_code": 200,
+            "ids": set(),
+            "listings": {},
+            "total_text": None,
+        }
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Every accommodation card links to /tools/<id>/accommodations/<id>
+    # Improved parsing: look for accommodation links more carefully
     ids: set = set()
     listings: dict = {}
+    
+    # Method 1: Look for /accommodations/ links in href attributes
     for a in soup.find_all("a", href=True):
         m = re.search(r"/accommodations/(\d+)", a["href"])
         if not m:
@@ -327,23 +387,51 @@ def check_listings(search_url: str) -> dict:
         ids.add(aid)
         if aid in listings:
             continue
+        
+        # Extract title and price from nearby elements
         title = a.get_text(strip=True) or f"Logement #{aid}"
+        
+        # Walk up to find price in parent container
         container = a
-        for _ in range(4):
+        for _ in range(5):  # look up to 5 levels up
             if container.parent is not None:
                 container = container.parent
+            else:
+                break
+        
         context_text = container.get_text(" ", strip=True)
-        price_match = re.search(r"[\d][\d\s]*(?:,\d+)?\s*€", context_text)
+        
+        # Look for price in format "123 €" or "123,45 €"
+        price_match = re.search(r"(\d+(?:\s?\d{3})*(?:,\d+)?)\s*€", context_text)
         price = price_match.group(0).strip() if price_match else "prix non précisé"
-        full_url = a["href"] if a["href"].startswith("http") else f"https://trouverunlogement.lescrous.fr{a['href']}"
+        
+        full_url = a["href"]
+        if not full_url.startswith("http"):
+            full_url = f"https://trouverunlogement.lescrous.fr{full_url}"
+        
         listings[aid] = {"title": title, "price": price, "url": full_url}
 
     total_match = re.search(r"(\d+)\s*logements?\s*trouv[ée]s?", resp.text, re.IGNORECASE)
     total_text = total_match.group(0) if total_match else None
 
+    # Determine if page loaded correctly
+    if len(ids) == 0:
+        # Empty result could be legitimate or a parsing/JS rendering issue
+        # If the page claims to have found 0 listings, that's OK
+        # But if the page is blank, that's suspicious
+        if len(resp.text) < 5000:  # very short page might indicate JS rendering issue
+            return {
+                "status": "empty_page",
+                "detail": f"Page looks empty or didn't render (possible JS loading issue)",
+                "http_code": 200,
+                "ids": set(),
+                "listings": {},
+                "total_text": total_text,
+            }
+
     return {
         "status":     "ok",
-        "detail":     total_text or f"{len(ids)} logement(s) détecté(s) sur la page",
+        "detail":     total_text or f"{len(ids)} logement(s) trouvé(s) sur la page",
         "http_code":  200,
         "ids":        ids,
         "listings":   listings,
@@ -352,8 +440,6 @@ def check_listings(search_url: str) -> dict:
 
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
-# KEY CHANGE: every send function now takes an explicit chat_id (the user
-# it's talking to) instead of a single hardcoded CHAT_ID.
 
 async def send_notification(app: Application, chat_id: int, text: str, reply_markup=None) -> None:
     try:
@@ -399,8 +485,6 @@ def send_ntfy_alarm(chat_id: int, listing_title: str) -> None:
 
 
 # ── Monitoring loop ───────────────────────────────────────────────────────────
-# KEY CHANGE: takes chat_id, reads/writes ONLY that user's state entry, and
-# is launched as its own asyncio task per user (see cmd_monitor / MONITOR_TASKS).
 
 async def monitor_loop(app: Application, chat_id: int) -> None:
     state = get_state(chat_id)
@@ -426,7 +510,7 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
                 if not state["monitoring"]:
                     break
 
-            result = check_listings(state["search_url"])
+            result = check_listings(state["search_url"], chat_id)
             status = result["status"]
             detail = result["detail"]
             prev_blocked = state["blocked"]
@@ -437,12 +521,12 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
 
             # ── Blocked / rate-limited / CAPTCHA ─────────────────────────────
             if status in ("blocked", "rate_limited", "captcha"):
-                state["error_streak"] += 1
+                state["error_streak"] = 0  # Reset error streak on these specific blocks
                 if not state["blocked"]:
                     state["blocked"] = True
                     await send_notification(
                         app, chat_id,
-                        f"⛔ <b>Surveillance bloquée !</b>\n"
+                        f"⛔ <b>Surveillance temporairement bloquée !</b>\n"
                         f"Raison : {detail}\n\n"
                         f"Pause de {BACKOFF_AFTER_BLOCK // 60} minutes avant la prochaine tentative…"
                     )
@@ -452,28 +536,57 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
 
             if prev_blocked and status == "ok":
                 state["blocked"] = False
-                state["error_streak"] = 0
                 await send_notification(
                     app, chat_id,
                     "✅ <b>Surveillance reprise</b> – les requêtes fonctionnent à nouveau."
                 )
 
-            # ── Errors ───────────────────────────────────────────────────────
+            # ── Empty/unparseable page ───────────────────────────────────────
+            if status == "empty_page":
+                state["error_streak"] += 1
+                current_time = time.time()
+                # Only warn if we haven't gotten empty pages for a while
+                if current_time - state["last_404_time"] > 60:
+                    await send_notification(
+                        app, chat_id,
+                        f"⚠️ <b>Page vide ou ne s'affiche pas correctement</b>\n"
+                        f"{detail}\n"
+                        f"Le site utilise peut-être JavaScript. Nouvelle tentative dans {BACKOFF_AFTER_ERROR}s."
+                    )
+                    state["last_404_time"] = current_time
+                state["extra_wait"] = BACKOFF_AFTER_ERROR
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
+
+            # ── Errors (timeouts, connection issues) ──────────────────────────
             if status == "error":
                 state["error_streak"] += 1
 
-                # HTTP 500 from CROUS is completely silent.
+                # HTTP 500 from CROUS - be silent but back off
                 if result.get("http_code") == 500:
+                    state["extra_wait"] = BACKOFF_AFTER_ERROR
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
+                # Only notify on first error in a streak
                 if state["error_streak"] == 1:
                     await send_notification(
                         app, chat_id,
                         f"⚠️ <b>Échec de la vérification</b>\n"
                         f"{detail}\n"
-                        f"Nouvelle tentative dans {CHECK_INTERVAL}s."
+                        f"Nouvelle tentative dans {BACKOFF_AFTER_ERROR}s."
                     )
+                
+                # If too many errors, back off significantly
+                if state["error_streak"] >= MAX_ERROR_STREAK:
+                    await send_notification(
+                        app, chat_id,
+                        f"❌ <b>Trop d'erreurs consécutives ({state['error_streak']})</b>\n"
+                        f"Pause de 2 minutes pour laisser le serveur respirer."
+                    )
+                    state["extra_wait"] = 120
+                else:
+                    state["extra_wait"] = BACKOFF_AFTER_ERROR
 
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
@@ -483,7 +596,8 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
             # ── Diff against the previous check ──────────────────────────────
             current_ids = result["ids"]
 
-            if state["known_ids"] is None:
+            if len(state["known_ids"]) == 0:
+                # First successful check - record baseline
                 state["known_ids"] = current_ids
                 await send_notification(
                     app, chat_id,
@@ -494,7 +608,8 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
                 new_ids = current_ids - state["known_ids"]
 
                 if new_ids:
-                    for aid in new_ids:
+                    logger.info(f"[{chat_id}] Found {len(new_ids)} NEW listings: {new_ids}")
+                    for aid in sorted(new_ids):
                         info = result["listings"].get(aid, {})
                         title = info.get("title", f"Logement #{aid}")
                         price = info.get("price", "prix non précisé")
@@ -509,6 +624,8 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
                             f"💶 {price}\n"
                             f"👉 <a href=\"{url}\">Voir l'annonce et réserver</a>"
                         )
+                else:
+                    logger.info(f"[{chat_id}] No new listings (current: {len(current_ids)}, known: {len(state['known_ids'])})")
 
                 state["known_ids"] = current_ids
 
@@ -595,7 +712,7 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state = get_state(update.effective_chat.id)
     state["search_url"] = None
     state["zone_label"] = None
-    state["known_ids"] = None
+    state["known_ids"] = set()
     state["awaiting"] = None
     await update.message.reply_text("🗑️ Zone effacée. Utilisez /ville ou /carte pour en choisir une nouvelle.")
 
@@ -614,7 +731,7 @@ async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state["blocked"]      = False
     state["extra_wait"]   = 0
     state["error_streak"] = 0
-    state["known_ids"]    = None
+    state["known_ids"]    = set()  # Reset to empty set to re-baseline
     # One independent background task per user ("worker").
     MONITOR_TASKS[chat_id] = ctx.application.create_task(monitor_loop(ctx.application, chat_id))
 
@@ -626,23 +743,24 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not state["monitoring"]:
         await update.message.reply_text("La surveillance n'est pas active.")
         return
-    state["monitoring"] = False  # monitor_loop will notice this and exit on its own
+    state["monitoring"] = False
     await update.message.reply_text("🛑 Surveillance arrêtée.")
 
 
 @restricted
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    state = get_state(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
     if not state["search_url"]:
         await update.message.reply_text("⚠️ Choisissez d'abord une zone avec /ville ou /carte.")
         return
     await update.message.reply_text("🔄 Vérification en cours…")
-    result = check_listings(state["search_url"])
+    result = check_listings(state["search_url"], chat_id)
     status = result["status"]
     detail = result["detail"]
     code = result.get("http_code")
 
-    emoji = {"ok": "✅", "blocked": "⛔", "rate_limited": "🚫", "captcha": "🤖", "error": "⚠️"}.get(status, "❓")
+    emoji = {"ok": "✅", "blocked": "⛔", "rate_limited": "🚫", "captcha": "🤖", "empty_page": "📭", "error": "⚠️"}.get(status, "❓")
     msg = f"{emoji} <b>{status.upper()}</b>\n{detail}\nHTTP: {code if code else 'N/A'}"
     if status == "ok":
         msg += f"\n\n👉 <a href=\"{state['search_url']}\">Voir les résultats</a>"
@@ -667,7 +785,7 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     s = get_state(update.effective_chat.id)
     last = s["last_check"].strftime("%d/%m %H:%M:%S") if s["last_check"] else "jamais"
-    known = len(s["known_ids"]) if s["known_ids"] is not None else "?"
+    known = len(s["known_ids"])
     await update.message.reply_html(
         f"📊 <b>État du bot</b>\n\n"
         f"Zone         : {s['zone_label'] or 'non définie'}\n"
@@ -701,7 +819,7 @@ async def on_free_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         url = build_search_url(geo["bounds"])
         state["search_url"] = url
         state["zone_label"] = geo["label"]
-        state["known_ids"] = None
+        state["known_ids"] = set()
         await update.message.reply_html(
             f"✅ Zone définie : <b>{geo['label']}</b>\n🔗 {url}\n\nUtilisez /monitor pour démarrer la surveillance."
         )
@@ -717,7 +835,7 @@ async def on_free_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         state["search_url"] = text
         state["zone_label"] = "zone choisie sur la carte"
-        state["known_ids"] = None
+        state["known_ids"] = set()
         await update.message.reply_html(
             f"✅ Zone définie à partir de votre lien.\n🔗 {text}\n\nUtilisez /monitor pour démarrer la surveillance."
         )
