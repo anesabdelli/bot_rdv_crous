@@ -116,6 +116,7 @@ def get_state(chat_id: int) -> dict:
             "search_url":   None,
             "zone_label":   None,
             "known_ids":    set(),  # Start as empty set, not None
+            "baseline_recorded": False,  # Track if first check baseline was recorded
             "blocked":      False,
             "check_count":  0,
             "last_check":   None,
@@ -596,9 +597,10 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
             # ── Diff against the previous check ──────────────────────────────
             current_ids = result["ids"]
 
-            if len(state["known_ids"]) == 0:
+            if not state["baseline_recorded"]:
                 # First successful check - record baseline
                 state["known_ids"] = current_ids
+                state["baseline_recorded"] = True
                 await send_notification(
                     app, chat_id,
                     f"ℹ️ Référence enregistrée : <b>{len(current_ids)}</b> logement(s) actuellement visibles "
@@ -727,11 +729,12 @@ async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if state["monitoring"] or chat_id in MONITOR_TASKS:
         await update.message.reply_text("Surveillance déjà active ! Utilisez /status pour voir l'état.")
         return
-    state["monitoring"]   = True
-    state["blocked"]      = False
-    state["extra_wait"]   = 0
-    state["error_streak"] = 0
-    state["known_ids"]    = set()  # Reset to empty set to re-baseline
+    state["monitoring"]        = True
+    state["blocked"]           = False
+    state["extra_wait"]        = 0
+    state["error_streak"]      = 0
+    state["baseline_recorded"] = False
+    state["known_ids"]         = set()  # Reset to empty set to re-baseline
     # One independent background task per user ("worker").
     MONITOR_TASKS[chat_id] = ctx.application.create_task(monitor_loop(ctx.application, chat_id))
 
