@@ -3,28 +3,13 @@
 Telegram bot that monitors trouverunlogement.lescrous.fr for newly published
 student housing offers ("logements") in a chosen search zone.
 
-MULTI-USER VERSION
-------------------
+MULTI-USER VERSION WITH WEBHOOK
+----------------------------------
 Every chat_id gets its own independent state (zone, known ids, monitoring
 flag, etc.) and its own background "worker" task. Starting /monitor in one
 person's chat has zero effect on anyone else's.
 
-Two ways to pick a search zone:
-  1) /ville  -> type a city or département name, the bot geocodes it
-                (via the official geo.api.gouv.fr API) and builds a
-                "bounds=" search URL itself.
-  2) /carte  -> the bot sends you the link to the site's interactive map.
-                You zoom/move to the area you want, click "Rechercher dans
-                la zone" on the site, then paste the resulting URL back to
-                the bot (it will contain a bounds=... parameter).
-
-Detection logic (each poll, per user):
-  - Fetch the stored search URL.
-  - HTTP 429 / 403 / CAPTCHA-like page -> blocked/rate-limited -> notify + back off.
-  - Otherwise, parse every accommodation link (/accommodations/<id>) on the
-    page. Compare against the ids seen on the previous check for THAT user.
-    Any id that is new fires the alarm (Telegram loud message + optional
-    ntfy.sh push to that user's topic, if configured).
+Deployment: Uses webhook mode for Render Web Service (free tier).
 """
 
 import asyncio
@@ -41,6 +26,7 @@ from typing import Dict, Optional
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from flask import Flask, request as flask_request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -70,12 +56,15 @@ CROUS_MAP_URL = CROUS_SEARCH_BASE_URL
 
 GEO_API_BASE = "https://geo.api.gouv.fr"
 
-CHECK_INTERVAL       = int(os.getenv("CHECK_INTERVAL", "5"))     # seconds between checks (increased from 2)
-REQUEST_TIMEOUT       = 30   # seconds for each HTTP request (increased from 15)
-BACKOFF_AFTER_BLOCK    = 300  # 5 min pause after getting blocked
-BACKOFF_AFTER_ERROR    = 10   # 10s pause after transient error
-MAX_ERROR_STREAK       = 5    # give up after 5 consecutive errors
-BBOX_PADDING_DEG       = 0.01  # ~1km padding added around a geocoded zone
+CHECK_INTERVAL       = int(os.getenv("CHECK_INTERVAL", "5"))
+REQUEST_TIMEOUT       = 30
+BACKOFF_AFTER_BLOCK    = 300
+BACKOFF_AFTER_ERROR    = 10
+MAX_ERROR_STREAK       = 5
+BBOX_PADDING_DEG       = 0.01
+
+RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME", "localhost:5000")
+WEBHOOK_PATH = "/telegram"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -103,9 +92,10 @@ USER_AGENTS = [
 # ── Per-user state ─────────────────────────────────────────────────────────────
 USER_STATES: Dict[int, dict] = {}
 MONITOR_TASKS: Dict[int, asyncio.Task] = {}
-
-# Per-user HTTP session for connection reuse
 USER_SESSIONS: Dict[int, requests.Session] = {}
+
+# Global Application instance (set by main)
+telegram_app: Optional[Application] = None
 
 
 def get_state(chat_id: int) -> dict:
@@ -115,15 +105,15 @@ def get_state(chat_id: int) -> dict:
             "monitoring":   False,
             "search_url":   None,
             "zone_label":   None,
-            "known_ids":    set(),  # Start as empty set, not None
-            "baseline_recorded": False,  # Track if first check baseline was recorded
+            "known_ids":    set(),
+            "baseline_recorded": False,
             "blocked":      False,
             "check_count":  0,
             "last_check":   None,
             "extra_wait":   0,
             "error_streak": 0,
             "awaiting":     None,
-            "last_404_time": 0,    # Track time of last "0 results" to detect parsing issues
+            "last_404_time": 0,
         }
     return USER_STATES[chat_id]
 
@@ -132,7 +122,6 @@ def get_session(chat_id: int) -> requests.Session:
     """Get or create a requests.Session for this user (connection reuse)."""
     if chat_id not in USER_SESSIONS:
         session = requests.Session()
-        # Persistent headers across all requests
         session.headers.update({
             "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language":           "fr-FR,fr;q=0.9,en;q=0.8",
@@ -165,7 +154,7 @@ def restricted(handler):
     return wrapper
 
 
-# ── Geocoding (geo.api.gouv.fr — official, free, no key needed) ──────────────
+# ── Geocoding ─────────────────────────────────────────────────────────────────
 
 def _bbox_from_geojson(geometry: dict) -> Optional[tuple]:
     """Return (min_lon, min_lat, max_lon, max_lat) from a GeoJSON Polygon/MultiPolygon."""
@@ -190,14 +179,10 @@ def _bbox_from_geojson(geometry: dict) -> Optional[tuple]:
 
 def geocode_place(query: str) -> Optional[dict]:
     """
-    Resolve a city name, city+postcode, or département name/code to a bounding
-    box, using the official French government geocoding API.
-
-    Returns {"label": str, "bounds": (min_lon, min_lat, max_lon, max_lat)} or None.
+    Resolve a city name, city+postcode, or département name/code to a bounding box.
     """
     query = query.strip()
 
-    # Département code, e.g. "75", "2A", "974"
     if re.fullmatch(r"\d{2,3}|2[AB]", query.upper()):
         try:
             r = requests.get(
@@ -213,7 +198,6 @@ def geocode_place(query: str) -> Optional[dict]:
         except requests.exceptions.RequestException as exc:
             logger.error(f"Geocoding (département) failed: {exc}")
 
-    # Try as a commune (city) name first
     try:
         r = requests.get(
             f"{GEO_API_BASE}/communes",
@@ -240,7 +224,6 @@ def geocode_place(query: str) -> Optional[dict]:
     except requests.exceptions.RequestException as exc:
         logger.error(f"Geocoding (commune) failed: {exc}")
 
-    # Fall back to département name (e.g. "Gironde")
     try:
         r = requests.get(
             f"{GEO_API_BASE}/departements",
@@ -266,7 +249,6 @@ def build_search_url(bounds: tuple) -> str:
     max_lon += BBOX_PADDING_DEG
     min_lat -= BBOX_PADDING_DEG
     max_lat += BBOX_PADDING_DEG
-    # CROUS expects: bounds=west_north_east_south
     bounds_str = f"{min_lon:.7f}_{max_lat:.7f}_{max_lon:.7f}_{min_lat:.7f}"
     sep = "&" if "?" in CROUS_SEARCH_BASE_URL else "?"
     return f"{CROUS_SEARCH_BASE_URL}{sep}bounds={bounds_str}"
@@ -276,19 +258,9 @@ def build_search_url(bounds: tuple) -> str:
 
 def check_listings(search_url: str, chat_id: int) -> dict:
     """
-    Fetch the CROUS search page and return:
-      {
-        "status":     "ok" | "blocked" | "rate_limited" | "captcha" | "error" | "empty_page",
-        "detail":     str,
-        "http_code":  int | None,
-        "ids":        set[str],   # accommodation ids found on the page
-        "listings":   {id: {"title", "price", "url"}},
-        "total_text": str | None,
-      }
+    Fetch the CROUS search page and return a dict with status, ids, and listings.
     """
     session = get_session(chat_id)
-    
-    # Randomize user-agent for each request
     session.headers["User-Agent"] = random.choice(USER_AGENTS)
 
     try:
@@ -375,11 +347,9 @@ def check_listings(search_url: str, chat_id: int) -> dict:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Improved parsing: look for accommodation links more carefully
     ids: set = set()
     listings: dict = {}
     
-    # Method 1: Look for /accommodations/ links in href attributes
     for a in soup.find_all("a", href=True):
         m = re.search(r"/accommodations/(\d+)", a["href"])
         if not m:
@@ -389,12 +359,10 @@ def check_listings(search_url: str, chat_id: int) -> dict:
         if aid in listings:
             continue
         
-        # Extract title and price from nearby elements
         title = a.get_text(strip=True) or f"Logement #{aid}"
         
-        # Walk up to find price in parent container
         container = a
-        for _ in range(5):  # look up to 5 levels up
+        for _ in range(5):
             if container.parent is not None:
                 container = container.parent
             else:
@@ -402,7 +370,6 @@ def check_listings(search_url: str, chat_id: int) -> dict:
         
         context_text = container.get_text(" ", strip=True)
         
-        # Look for price in format "123 €" or "123,45 €"
         price_match = re.search(r"(\d+(?:\s?\d{3})*(?:,\d+)?)\s*€", context_text)
         price = price_match.group(0).strip() if price_match else "prix non précisé"
         
@@ -415,12 +382,8 @@ def check_listings(search_url: str, chat_id: int) -> dict:
     total_match = re.search(r"(\d+)\s*logements?\s*trouv[ée]s?", resp.text, re.IGNORECASE)
     total_text = total_match.group(0) if total_match else None
 
-    # Determine if page loaded correctly
     if len(ids) == 0:
-        # Empty result could be legitimate or a parsing/JS rendering issue
-        # If the page claims to have found 0 listings, that's OK
-        # But if the page is blank, that's suspicious
-        if len(resp.text) < 5000:  # very short page might indicate JS rendering issue
+        if len(resp.text) < 5000:
             return {
                 "status": "empty_page",
                 "detail": f"Page looks empty or didn't render (possible JS loading issue)",
@@ -442,19 +405,23 @@ def check_listings(search_url: str, chat_id: int) -> dict:
 
 # ── Telegram helpers ──────────────────────────────────────────────────────────
 
-async def send_notification(app: Application, chat_id: int, text: str, reply_markup=None) -> None:
+async def send_notification(chat_id: int, text: str, reply_markup=None) -> None:
+    if not telegram_app:
+        return
     try:
-        await app.bot.send_message(
+        await telegram_app.bot.send_message(
             chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
         )
     except Exception as exc:
         logger.error(f"Failed to send Telegram message to {chat_id}: {exc}")
 
 
-async def send_alarm(app: Application, chat_id: int, text: str) -> None:
+async def send_alarm(chat_id: int, text: str) -> None:
     """Loud notification for a brand-new listing."""
+    if not telegram_app:
+        return
     try:
-        await app.bot.send_message(
+        await telegram_app.bot.send_message(
             chat_id=chat_id,
             text="🚨🔥 " + text,
             parse_mode=ParseMode.HTML,
@@ -487,11 +454,11 @@ def send_ntfy_alarm(chat_id: int, listing_title: str) -> None:
 
 # ── Monitoring loop ───────────────────────────────────────────────────────────
 
-async def monitor_loop(app: Application, chat_id: int) -> None:
+async def monitor_loop(chat_id: int) -> None:
     state = get_state(chat_id)
     logger.info(f"Monitoring loop started for chat {chat_id}")
     await send_notification(
-        app, chat_id,
+        chat_id,
         f"🔍 <b>Surveillance démarrée</b>\n"
         f"Zone : {state['zone_label'] or 'personnalisée'}\n"
         f"Fréquence : toutes les {CHECK_INTERVAL}s\n"
@@ -520,13 +487,12 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
             state["last_check"] = datetime.now()
             logger.info(f"[{chat_id}] Check #{state['check_count']}: [{status}] {detail}")
 
-            # ── Blocked / rate-limited / CAPTCHA ─────────────────────────────
             if status in ("blocked", "rate_limited", "captcha"):
-                state["error_streak"] = 0  # Reset error streak on these specific blocks
+                state["error_streak"] = 0
                 if not state["blocked"]:
                     state["blocked"] = True
                     await send_notification(
-                        app, chat_id,
+                        chat_id,
                         f"⛔ <b>Surveillance temporairement bloquée !</b>\n"
                         f"Raison : {detail}\n\n"
                         f"Pause de {BACKOFF_AFTER_BLOCK // 60} minutes avant la prochaine tentative…"
@@ -538,18 +504,16 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
             if prev_blocked and status == "ok":
                 state["blocked"] = False
                 await send_notification(
-                    app, chat_id,
+                    chat_id,
                     "✅ <b>Surveillance reprise</b> – les requêtes fonctionnent à nouveau."
                 )
 
-            # ── Empty/unparseable page ───────────────────────────────────────
             if status == "empty_page":
                 state["error_streak"] += 1
                 current_time = time.time()
-                # Only warn if we haven't gotten empty pages for a while
                 if current_time - state["last_404_time"] > 60:
                     await send_notification(
-                        app, chat_id,
+                        chat_id,
                         f"⚠️ <b>Page vide ou ne s'affiche pas correctement</b>\n"
                         f"{detail}\n"
                         f"Le site utilise peut-être JavaScript. Nouvelle tentative dans {BACKOFF_AFTER_ERROR}s."
@@ -559,29 +523,25 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            # ── Errors (timeouts, connection issues) ──────────────────────────
             if status == "error":
                 state["error_streak"] += 1
 
-                # HTTP 500 from CROUS - be silent but back off
                 if result.get("http_code") == 500:
                     state["extra_wait"] = BACKOFF_AFTER_ERROR
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
-                # Only notify on first error in a streak
                 if state["error_streak"] == 1:
                     await send_notification(
-                        app, chat_id,
+                        chat_id,
                         f"⚠️ <b>Échec de la vérification</b>\n"
                         f"{detail}\n"
                         f"Nouvelle tentative dans {BACKOFF_AFTER_ERROR}s."
                     )
                 
-                # If too many errors, back off significantly
                 if state["error_streak"] >= MAX_ERROR_STREAK:
                     await send_notification(
-                        app, chat_id,
+                        chat_id,
                         f"❌ <b>Trop d'erreurs consécutives ({state['error_streak']})</b>\n"
                         f"Pause de 2 minutes pour laisser le serveur respirer."
                     )
@@ -594,15 +554,13 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
 
             state["error_streak"] = 0
 
-            # ── Diff against the previous check ──────────────────────────────
             current_ids = result["ids"]
 
             if not state["baseline_recorded"]:
-                # First successful check - record baseline
                 state["known_ids"] = current_ids
                 state["baseline_recorded"] = True
                 await send_notification(
-                    app, chat_id,
+                    chat_id,
                     f"ℹ️ Référence enregistrée : <b>{len(current_ids)}</b> logement(s) actuellement visibles "
                     f"dans cette zone.\nJe vous alerte dès qu'un nouveau logement apparaît."
                 )
@@ -620,7 +578,7 @@ async def monitor_loop(app: Application, chat_id: int) -> None:
                         send_ntfy_alarm(chat_id, title)
 
                         await send_alarm(
-                            app, chat_id,
+                            chat_id,
                             f"<b>NOUVEAU LOGEMENT CROUS !</b>\n"
                             f"🏠 {title}\n"
                             f"💶 {price}\n"
@@ -660,7 +618,7 @@ MAIN_MENU_TEXT = (
 @restricted
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    get_state(chat_id)  # ensure this user has their own state entry
+    get_state(chat_id)
     await update.message.reply_html(
         f"👋 Bienvenue !\n\nVotre chat ID est : <code>{chat_id}</code>\n\n{MAIN_MENU_TEXT}"
     )
@@ -734,9 +692,8 @@ async def cmd_monitor(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     state["extra_wait"]        = 0
     state["error_streak"]      = 0
     state["baseline_recorded"] = False
-    state["known_ids"]         = set()  # Reset to empty set to re-baseline
-    # One independent background task per user ("worker").
-    MONITOR_TASKS[chat_id] = ctx.application.create_task(monitor_loop(ctx.application, chat_id))
+    state["known_ids"]         = set()
+    MONITOR_TASKS[chat_id] = asyncio.create_task(monitor_loop(chat_id))
 
 
 @restricted
@@ -777,7 +734,7 @@ async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🔔 Déclenchement d'une alerte de test…")
     send_ntfy_alarm(chat_id, "[TEST] Logement fictif")
     await send_alarm(
-        ctx.application, chat_id,
+        chat_id,
         f"<b>[TEST] NOUVEAU LOGEMENT CROUS !</b>\n"
         f"Ceci est une notification de test.\n\n"
         f"👉 <a href=\"{state['search_url'] or CROUS_SEARCH_BASE_URL}\">Voir les résultats</a>"
@@ -844,7 +801,6 @@ async def on_free_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Not expecting free text right now
     await update.message.reply_text("Utilisez /help pour voir les commandes disponibles.")
 
 
@@ -868,7 +824,33 @@ async def post_init(app: Application) -> None:
     )
 
 
-def main() -> None:
+def create_flask_app(telegram_application: Application) -> Flask:
+    """Create Flask app for webhook handling."""
+    flask_app = Flask(__name__)
+
+    @flask_app.route("/health", methods=["GET"])
+    def health():
+        return {"status": "ok"}, 200
+
+    @flask_app.route(WEBHOOK_PATH, methods=["POST"])
+    async def telegram_webhook():
+        """Handle incoming Telegram updates via webhook."""
+        try:
+            update_data = flask_request.get_json()
+            if update_data:
+                update = Update.de_json(update_data, telegram_application.bot)
+                await telegram_application.process_update(update)
+        except Exception as exc:
+            logger.error(f"Error processing update: {exc}")
+        return "OK", 200
+
+    return flask_app
+
+
+async def main_async():
+    """Async main function."""
+    global telegram_app
+
     if not BOT_TOKEN:
         logger.error(
             "TELEGRAM_BOT_TOKEN is not set.\n"
@@ -877,24 +859,122 @@ def main() -> None:
         )
         sys.exit(1)
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    telegram_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("ville",   cmd_ville))
-    app.add_handler(CommandHandler("carte",   cmd_carte))
-    app.add_handler(CommandHandler("zone",    cmd_zone))
-    app.add_handler(CommandHandler("monitor", cmd_monitor))
-    app.add_handler(CommandHandler("stop",    cmd_stop))
-    app.add_handler(CommandHandler("check",   cmd_check))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("test",    cmd_test))
-    app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_free_text))
+    telegram_app.add_handler(CommandHandler("start",   cmd_start))
+    telegram_app.add_handler(CommandHandler("help",    cmd_help))
+    telegram_app.add_handler(CommandHandler("ville",   cmd_ville))
+    telegram_app.add_handler(CommandHandler("carte",   cmd_carte))
+    telegram_app.add_handler(CommandHandler("zone",    cmd_zone))
+    telegram_app.add_handler(CommandHandler("monitor", cmd_monitor))
+    telegram_app.add_handler(CommandHandler("stop",    cmd_stop))
+    telegram_app.add_handler(CommandHandler("check",   cmd_check))
+    telegram_app.add_handler(CommandHandler("status",  cmd_status))
+    telegram_app.add_handler(CommandHandler("test",    cmd_test))
+    telegram_app.add_handler(CommandHandler("reset",   cmd_reset))
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_free_text))
 
-    logger.info("Bot starting…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Starting Telegram bot in webhook mode…")
+    
+    # Set webhook
+    webhook_url = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
+    logger.info(f"Setting webhook to: {webhook_url}")
+    try:
+        await telegram_app.bot.set_webhook(url=webhook_url)
+    except Exception as exc:
+        logger.error(f"Failed to set webhook: {exc}")
+
+    # Start bot with webhook
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    logger.info("Bot running in webhook mode")
+    
+    # Keep the bot running (Render will manage the process)
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Shutting down…")
+        await telegram_app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio as aio
+
+    # Create Flask app (for Render)
+    telegram_app_temp = None
+    
+    async def setup_and_run():
+        global telegram_app
+        
+        if not BOT_TOKEN:
+            logger.error("TELEGRAM_BOT_TOKEN is not set.")
+            sys.exit(1)
+
+        telegram_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+        telegram_app.add_handler(CommandHandler("start",   cmd_start))
+        telegram_app.add_handler(CommandHandler("help",    cmd_help))
+        telegram_app.add_handler(CommandHandler("ville",   cmd_ville))
+        telegram_app.add_handler(CommandHandler("carte",   cmd_carte))
+        telegram_app.add_handler(CommandHandler("zone",    cmd_zone))
+        telegram_app.add_handler(CommandHandler("monitor", cmd_monitor))
+        telegram_app.add_handler(CommandHandler("stop",    cmd_stop))
+        telegram_app.add_handler(CommandHandler("check",   cmd_check))
+        telegram_app.add_handler(CommandHandler("status",  cmd_status))
+        telegram_app.add_handler(CommandHandler("test",    cmd_test))
+        telegram_app.add_handler(CommandHandler("reset",   cmd_reset))
+        telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_free_text))
+
+        # Initialize
+        await telegram_app.initialize()
+
+        # Create Flask app
+        flask_app = Flask(__name__)
+
+        @flask_app.route("/health", methods=["GET"])
+        def health():
+            return {"status": "ok"}, 200
+
+        @flask_app.route(WEBHOOK_PATH, methods=["POST"])
+        async def telegram_webhook():
+            try:
+                update_data = flask_request.get_json()
+                if update_data:
+                    update = Update.de_json(update_data, telegram_app.bot)
+                    await telegram_app.process_update(update)
+            except Exception as exc:
+                logger.error(f"Error processing update: {exc}")
+            return "OK", 200
+
+        # Set webhook
+        webhook_url = f"https://{RENDER_EXTERNAL_HOSTNAME}{WEBHOOK_PATH}"
+        logger.info(f"Setting webhook to: {webhook_url}")
+        try:
+            await telegram_app.bot.set_webhook(url=webhook_url)
+            logger.info("✅ Webhook set successfully")
+        except Exception as exc:
+            logger.error(f"❌ Failed to set webhook: {exc}")
+
+        # Run Flask on the port Render assigns
+        port = int(os.getenv("PORT", 5000))
+        logger.info(f"Starting Flask server on port {port}…")
+        
+        # Run Flask in a thread and keep bot alive
+        import threading
+        flask_thread = threading.Thread(
+            target=lambda: flask_app.run(host="0.0.0.0", port=port, debug=False),
+            daemon=True
+        )
+        flask_thread.start()
+
+        # Keep the bot alive
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Shutting down…")
+            await telegram_app.stop()
+
+    aio.run(setup_and_run())
