@@ -125,3 +125,4 @@ WantedBy=multi-user.target
 ## Licence
 
 Usage personnel. Aucune garantie fournie.
+This bot is for personal use only
