@@ -938,12 +938,13 @@ if __name__ == "__main__":
             return {"status": "ok"}, 200
 
         @flask_app.route(WEBHOOK_PATH, methods=["POST"])
-        async def telegram_webhook():
+        def telegram_webhook():
             try:
                 update_data = flask_request.get_json()
                 if update_data:
                     update = Update.de_json(update_data, telegram_app.bot)
-                    await telegram_app.process_update(update)
+                    # Run async function in sync context
+                    asyncio.run(telegram_app.process_update(update))
             except Exception as exc:
                 logger.error(f"Error processing update: {exc}")
             return "OK", 200
